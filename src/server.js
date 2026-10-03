@@ -635,6 +635,14 @@ app.put('/api/plans/:planId', (req, res) => {
     return fail(res, 409, `仅草稿计划可修改（当前为 ${statusZh(plan.status)}）`);
   }
   const body = req.body || {};
+  // 整套备料单关联计划只能随整套单管理，不能在原入口单独修改
+  if (plan.comboId) {
+    return res.status(409).json({
+      ok: false, code: 'combo_managed',
+      error: `该计划属于整套备料单 #${plan.comboId}，不能在此单独修改；请到“整套备料”页操作`,
+      comboId: plan.comboId,
+    });
+  }
   // 未传字段沿用旧值
   const merged = {
     publicationId: body.publicationId !== undefined ? Number(body.publicationId) : plan.publicationId,
@@ -667,6 +675,13 @@ app.put('/api/plans/:planId', (req, res) => {
     segmentCount: built.layout.segmentCount,
     layout: built.layout,
   });
+  if (r.code === 'combo_managed') {
+    return res.status(409).json({
+      ok: false, code: 'combo_managed',
+      error: `该计划属于整套备料单 #${r.comboId}，不能单独修改`,
+      comboId: r.comboId,
+    });
+  }
   if (r.code !== 'ok') return fail(res, 409, '计划状态已变化，请刷新后重试');
   res.json({ ok: true, plan: serializePlan(r.plan) });
 });
@@ -675,7 +690,21 @@ app.put('/api/plans/:planId', (req, res) => {
 app.post('/api/plans/:planId/confirm', (req, res) => {
   const plan = db.getPlan(Number(req.params.planId));
   if (!plan) return fail(res, 404, '生产计划不存在');
+  if (plan.comboId) {
+    return res.status(409).json({
+      ok: false, code: 'combo_managed',
+      error: `该计划属于整套备料单 #${plan.comboId}，由整套单统一确认，不能单独操作`,
+      comboId: plan.comboId, plan: serializePlan(db.getPlan(plan.id)),
+    });
+  }
   const r = db.confirmPlan(plan.id);
+  if (r.code === 'combo_managed') {
+    return res.status(409).json({
+      ok: false, code: 'combo_managed',
+      error: `该计划属于整套备料单 #${r.comboId}，由整套单统一确认`,
+      comboId: r.comboId,
+    });
+  }
   if (r.code === 'already_confirmed') {
     return res.status(409).json({ ok: false, error: '计划已确认，无需重复确认（库存未重复预留）', plan: serializePlan(db.getPlan(plan.id)) });
   }
@@ -701,7 +730,21 @@ app.post('/api/plans/:planId/confirm', (req, res) => {
 app.post('/api/plans/:planId/cancel', (req, res) => {
   const plan = db.getPlan(Number(req.params.planId));
   if (!plan) return fail(res, 404, '生产计划不存在');
+  if (plan.comboId) {
+    return res.status(409).json({
+      ok: false, code: 'combo_managed',
+      error: `该计划属于整套备料单 #${plan.comboId}，取消整套单时会统一释放铅条预留，不能在此单独取消`,
+      comboId: plan.comboId, plan: serializePlan(db.getPlan(plan.id)),
+    });
+  }
   const r = db.cancelPlan(plan.id);
+  if (r.code === 'combo_managed') {
+    return res.status(409).json({
+      ok: false, code: 'combo_managed',
+      error: `该计划属于整套备料单 #${r.comboId}，请取消整套单以统一释放预留`,
+      comboId: r.comboId,
+    });
+  }
   if (r.code === 'draft_not_reserved') {
     return fail(res, 409, '草稿计划尚未预留库存，无需取消（可直接删除）');
   }
@@ -713,7 +756,23 @@ app.post('/api/plans/:planId/cancel', (req, res) => {
 
 // 删除草稿/已取消计划（已确认计划须先取消）
 app.delete('/api/plans/:planId', (req, res) => {
-  const r = db.deletePlan(Number(req.params.planId));
+  const existing = db.getPlan(Number(req.params.planId));
+  if (!existing) return fail(res, 404, '生产计划不存在');
+  if (existing.comboId) {
+    return res.status(409).json({
+      ok: false, code: 'combo_managed',
+      error: `该计划属于整套备料单 #${existing.comboId}，不能单独删除`,
+      comboId: existing.comboId,
+    });
+  }
+  const r = db.deletePlan(existing.id);
+  if (r.code === 'combo_managed') {
+    return res.status(409).json({
+      ok: false, code: 'combo_managed',
+      error: `该计划属于整套备料单 #${r.comboId}，不能单独删除`,
+      comboId: r.comboId,
+    });
+  }
   if (r.code === 'not_found') return fail(res, 404, '生产计划不存在');
   if (r.code === 'confirmed_delete_blocked') {
     return fail(res, 409, '已确认计划不能删除；请先取消以释放库存');
@@ -760,6 +819,8 @@ function serializePlan(plan) {
     shortage: plan.status === 'draft' ? shortage : 0,
     feasible: plan.status !== 'draft' || shortage === 0,
     snapshotBound: true,
+    comboId: plan.comboId,
+    comboManaged: !!plan.comboId,
     createdAt: plan.createdAt,
     updatedAt: plan.updatedAt,
     confirmedAt: plan.confirmedAt,
@@ -984,6 +1045,13 @@ app.get('/api/cut-orders/:orderId', (req, res) => {
 app.put('/api/cut-orders/:orderId', (req, res) => {
   const order = db.getCutOrder(Number(req.params.orderId));
   if (!order) return fail(res, 404, '裁片订单不存在');
+  if (order.comboId) {
+    return res.status(409).json({
+      ok: false, code: 'combo_managed',
+      error: `该订单属于整套备料单 #${order.comboId}，不能在此单独修改；请到“整套备料”页操作`,
+      comboId: order.comboId,
+    });
+  }
   if (order.status !== 'draft') {
     return fail(res, 409, `仅草稿订单可修改（当前为 ${cutStatusZh(order.status)}）`);
   }
@@ -1015,6 +1083,13 @@ app.put('/api/cut-orders/:orderId', (req, res) => {
     layout: built.layout,
     items: preview.items,
   });
+  if (r.code === 'combo_managed') {
+    return res.status(409).json({
+      ok: false, code: 'combo_managed',
+      error: `该订单属于整套备料单 #${r.comboId}，不能单独修改`,
+      comboId: r.comboId,
+    });
+  }
   if (r.code !== 'ok') return fail(res, 409, '订单状态已变化，请刷新后重试');
   res.json({ ok: true, order: serializeCutOrder(r.order) });
 });
@@ -1023,7 +1098,21 @@ app.put('/api/cut-orders/:orderId', (req, res) => {
 app.post('/api/cut-orders/:orderId/confirm', (req, res) => {
   const order = db.getCutOrder(Number(req.params.orderId));
   if (!order) return fail(res, 404, '裁片订单不存在');
+  if (order.comboId) {
+    return res.status(409).json({
+      ok: false, code: 'combo_managed',
+      error: `该订单属于整套备料单 #${order.comboId}，由整套单统一确认，不能单独操作`,
+      comboId: order.comboId, order: serializeCutOrder(order),
+    });
+  }
   const r = db.confirmCutOrder(order.id);
+  if (r.code === 'combo_managed') {
+    return res.status(409).json({
+      ok: false, code: 'combo_managed',
+      error: `该订单属于整套备料单 #${r.comboId}，由整套单统一确认`,
+      comboId: r.comboId,
+    });
+  }
   if (r.code === 'already_confirmed') {
     return res.status(409).json({
       ok: false, error: '订单已确认，无需重复确认（库存未重复预留）',
@@ -1058,7 +1147,21 @@ app.post('/api/cut-orders/:orderId/confirm', (req, res) => {
 app.post('/api/cut-orders/:orderId/cancel', (req, res) => {
   const order = db.getCutOrder(Number(req.params.orderId));
   if (!order) return fail(res, 404, '裁片订单不存在');
+  if (order.comboId) {
+    return res.status(409).json({
+      ok: false, code: 'combo_managed',
+      error: `该订单属于整套备料单 #${order.comboId}，取消整套单时会统一释放玻璃预留，不能在此单独取消`,
+      comboId: order.comboId, order: serializeCutOrder(order),
+    });
+  }
   const r = db.cancelCutOrder(order.id);
+  if (r.code === 'combo_managed') {
+    return res.status(409).json({
+      ok: false, code: 'combo_managed',
+      error: `该订单属于整套备料单 #${r.comboId}，请取消整套单以统一释放预留`,
+      comboId: r.comboId,
+    });
+  }
   if (r.code === 'draft_not_reserved') {
     return fail(res, 409, '草稿订单尚未预留库存，无需取消（可直接删除）');
   }
@@ -1079,7 +1182,23 @@ app.post('/api/cut-orders/:orderId/cancel', (req, res) => {
 });
 
 app.delete('/api/cut-orders/:orderId', (req, res) => {
-  const r = db.deleteCutOrder(Number(req.params.orderId));
+  const existing = db.getCutOrder(Number(req.params.orderId));
+  if (!existing) return fail(res, 404, '裁片订单不存在');
+  if (existing.comboId) {
+    return res.status(409).json({
+      ok: false, code: 'combo_managed',
+      error: `该订单属于整套备料单 #${existing.comboId}，不能单独删除`,
+      comboId: existing.comboId,
+    });
+  }
+  const r = db.deleteCutOrder(existing.id);
+  if (r.code === 'combo_managed') {
+    return res.status(409).json({
+      ok: false, code: 'combo_managed',
+      error: `该订单属于整套备料单 #${r.comboId}，不能单独删除`,
+      comboId: r.comboId,
+    });
+  }
   if (r.code === 'not_found') return fail(res, 404, '裁片订单不存在');
   if (r.code === 'confirmed_delete_blocked') {
     return fail(res, 409, '已确认订单不能删除；请先取消以释放库存');
@@ -1223,6 +1342,13 @@ function replacementPayload(order, inp, built) {
 app.post('/api/cut-orders/:orderId/replacement/preview', (req, res) => {
   const order = db.getCutOrder(Number(req.params.orderId));
   if (!order) return fail(res, 404, '裁片订单不存在');
+  if (order.comboId) {
+    return res.status(409).json({
+      ok: false, code: 'combo_managed',
+      error: `该订单属于整套备料单 #${order.comboId}，铅条与玻璃绑定同一快照，不能单独换单`,
+      comboId: order.comboId,
+    });
+  }
   if (rejectIfNotConfirmed(res, order)) return;
   const inp = resolveReplaceInputs(req.body || {}, order);
   if (inp.error) {
@@ -1242,6 +1368,13 @@ app.post('/api/cut-orders/:orderId/replacement/preview', (req, res) => {
 app.post('/api/cut-orders/:orderId/replacement', (req, res) => {
   const order = db.getCutOrder(Number(req.params.orderId));
   if (!order) return fail(res, 404, '裁片订单不存在');
+  if (order.comboId) {
+    return res.status(409).json({
+      ok: false, code: 'combo_managed',
+      error: `该订单属于整套备料单 #${order.comboId}，铅条与玻璃绑定同一快照，不能单独换单`,
+      comboId: order.comboId,
+    });
+  }
   const body = req.body || {};
 
   // 已有换单记录：按参数判定幂等/冲突（不重新排样、不写库、不重复预留）
@@ -1332,6 +1465,13 @@ app.post('/api/cut-orders/:orderId/replacement', (req, res) => {
       order: serializeCutOrder(db.getCutOrder(order.id)),
     });
   }
+  if (r.code === 'combo_managed') {
+    return res.status(409).json({
+      ok: false, code: 'combo_managed',
+      error: `该订单属于整套备料单 #${r.comboId}，不能单独换单`,
+      comboId: r.comboId,
+    });
+  }
   if (r.code === 'order_canceled') return fail(res, 409, '旧单已取消，不能换单');
   if (r.code === 'order_not_confirmed') return fail(res, 409, '仅已确认订单可以换单');
   if (r.code === 'sheet_missing') return fail(res, 409, `颜色 ${r.color} 的原片规格已不存在，无法换单`);
@@ -1372,6 +1512,293 @@ function cutStatusZh(status) {
     : status === 'replaced' ? '已替换'
     : '已取消';
 }
+
+// ================= 整套备料单（铅条 + 玻璃 一次确认） =================
+
+const COMBO_NAME_MAX = 80;
+const COMBO_KEY_MAX = 120;
+
+// 解析整套备料参数（沿用排产切段与玻璃排样各自的校验规则）。
+// 返回 { error,status } 或 { pub, material, copies, kerfH, gap }
+function resolveComboInputs(body) {
+  const b = body || {};
+  const inp = resolvePlanInputs({
+    publicationId: b.publicationId,
+    materialId: b.materialId,
+    copies: b.copies,
+    kerf: b.kerf,
+  });
+  if (inp.error) return { error: inp.error, status: inp.status };
+  const pr = sheetNest.parseNestingParams({ copies: inp.copies, gap: b.gap });
+  if (!pr.ok) return { error: pr.error };
+  return {
+    pub: inp.pub,
+    material: inp.material,
+    copies: inp.copies,
+    kerfH: inp.kerfH,
+    gap: pr.params.gap,
+  };
+}
+
+// 一次性构建铅条切段 + 玻璃排样两套方案；任一失败整单拒绝（不占库存）。
+// 返回 { error,status,code,... } 或 { leadLayout, glassLayout, specs, items }
+function buildComboLayouts(inp) {
+  const lead = buildPlanLayout(inp);
+  if (lead.error) {
+    return {
+      error: lead.error, status: lead.status || 400, code: lead.code,
+      segment: lead.segment || undefined,
+    };
+  }
+  const nest = buildNestLayout(inp.pub, inp.copies, inp.gap);
+  if (nest.error) {
+    return {
+      error: nest.error, status: nest.status || 422, code: nest.code,
+      color: nest.color, pieceNo: nest.pieceNo, copy: nest.copy,
+      pieceWidth: nest.pieceWidth, pieceHeight: nest.pieceHeight,
+      sheetWidth: nest.sheetWidth, sheetHeight: nest.sheetHeight,
+      totalSheets: nest.totalSheets, maxSheets: nest.maxSheets,
+    };
+  }
+  const colors = colorSummaries(nest.layout, nest.specs);
+  const items = colors.map((c) => ({
+    sheetId: c.sheetId, color: c.color,
+    width: c.sheetWidth, height: c.sheetHeight,
+    requiredSheets: c.requiredSheets,
+  }));
+  if (items.some((it) => it.sheetId === null)) {
+    const c = colors.find((x) => x.sheetId === null);
+    return { error: `缺少颜色 ${c ? c.color : ''} 的原片规格登记`, status: 422, code: 'missing_color', color: c ? c.color : undefined };
+  }
+  return { leadLayout: lead.layout, glassLayout: nest.layout, specs: nest.specs, items, colors };
+}
+
+// 预览（不落库、不占库存）：列出铅条根数、各色原片张数、可用量与缺口
+app.post('/api/combo-orders/preview', (req, res) => {
+  const body = req.body || {};
+  const inp = resolveComboInputs(body);
+  if (inp.error) return fail(res, inp.status || 400, inp.error);
+  const built = buildComboLayouts(inp);
+  if (built.error) {
+    return res.status(built.status || 422).json({
+      ok: false, error: built.error, code: built.code,
+      segment: built.segment, color: built.color,
+      pieceNo: built.pieceNo, copy: built.copy,
+      pieceWidth: built.pieceWidth, pieceHeight: built.pieceHeight,
+      sheetWidth: built.sheetWidth, sheetHeight: built.sheetHeight,
+      totalSheets: built.totalSheets, maxSheets: built.maxSheets,
+    });
+  }
+  res.json({ ok: true, preview: comboPreviewPayload(inp, built) });
+});
+
+function comboPreviewPayload(inp, built) {
+  const material = db.getMaterial(inp.material.id); // 取最新 stock/reserved/available
+  const leadShortage = Math.max(0, built.leadLayout.requiredBars - material.available);
+  const glassShortages = built.colors
+    .filter((c) => c.shortage > 0)
+    .map((c) => ({
+      color: c.color, required: c.requiredSheets,
+      available: c.available, shortage: c.shortage,
+    }));
+  const glassTotalShortage = built.colors.reduce((s, c) => s + c.shortage, 0);
+  return {
+    publicationId: inp.pub.id,
+    designId: inp.pub.designId,
+    version: inp.pub.version,
+    copies: inp.copies,
+    kerf: cut.hToMm(inp.kerfH),
+    gap: inp.gap,
+    lead: {
+      material: materialBrief(material),
+      layout: built.leadLayout,
+      requiredBars: built.leadLayout.requiredBars,
+      availableBars: material.available,
+      shortage: leadShortage,
+    },
+    glass: {
+      layout: built.glassLayout,
+      totalSheets: built.glassLayout.totalSheets,
+      maxSheets: built.glassLayout.maxSheets,
+      colors: built.colors,
+      totalShortage: glassTotalShortage,
+      shortages: glassShortages,
+    },
+    items: built.items,
+    totalShortage: leadShortage + glassTotalShortage,
+    feasible: leadShortage === 0 && glassTotalShortage === 0,
+  };
+}
+
+// 创建并一次确认：同一事务内核验并预留两类库存；任一不足全部保持原状。
+// 可带 idempotencyKey：相同参数重复确认返回原单，不同参数 409 冲突，均不重复预留。
+app.post('/api/combo-orders', (req, res) => {
+  const body = req.body || {};
+  const inp = resolveComboInputs(body);
+  if (inp.error) return fail(res, inp.status || 400, inp.error);
+  const built = buildComboLayouts(inp);
+  if (built.error) {
+    return res.status(built.status || 422).json({
+      ok: false, error: built.error, code: built.code,
+      segment: built.segment, color: built.color,
+      pieceNo: built.pieceNo, copy: built.copy,
+      pieceWidth: built.pieceWidth, pieceHeight: built.pieceHeight,
+      sheetWidth: built.sheetWidth, sheetHeight: built.sheetHeight,
+      totalSheets: built.totalSheets, maxSheets: built.maxSheets,
+    });
+  }
+
+  let idempotencyKey = null;
+  if (body.idempotencyKey !== undefined && body.idempotencyKey !== null) {
+    if (typeof body.idempotencyKey !== 'string' || !body.idempotencyKey.trim()) {
+      return fail(res, 400, 'idempotencyKey 必须是非空字符串');
+    }
+    idempotencyKey = body.idempotencyKey.trim().slice(0, COMBO_KEY_MAX);
+  }
+
+  const name = typeof body.name === 'string' && body.name.trim()
+    ? body.name.trim().slice(0, COMBO_NAME_MAX)
+    : `整套备料 v${inp.pub.version} ×${inp.copies}件`;
+
+  const r = db.createComboOrderConfirmed({
+    name,
+    pub: { id: inp.pub.id, designId: inp.pub.designId, version: inp.pub.version },
+    copies: inp.copies,
+    material: { id: inp.material.id, name: inp.material.name, lengthH: inp.material.lengthH },
+    kerfH: inp.kerfH,
+    requiredBars: built.leadLayout.requiredBars,
+    segmentCount: built.leadLayout.segmentCount,
+    leadLayout: built.leadLayout,
+    gap: inp.gap,
+    totalSheets: built.glassLayout.totalSheets,
+    glassLayout: built.glassLayout,
+    items: built.items,
+    idempotencyKey,
+  });
+
+  if (r.code === 'idempotent') {
+    return res.json({ ok: true, idempotent: true, combo: serializeComboOrder(r.combo) });
+  }
+  if (r.code === 'param_conflict') {
+    const existing = db.getComboOrder(r.existingId);
+    return res.status(409).json({
+      ok: false,
+      code: 'param_conflict',
+      error: '该幂等键已用于参数不同的整套备料单（未重复预留）',
+      existingCombo: existing ? serializeComboOrder(existing) : { id: r.existingId },
+    });
+  }
+  if (r.code === 'material_missing') return fail(res, 409, '原材规格已不存在，无法确认');
+  if (r.code === 'material_changed') {
+    return fail(res, 409, '原材定尺自方案生成后已变化，请刷新后重试');
+  }
+  if (r.code === 'sheet_missing') return fail(res, 409, `颜色 ${r.color} 的原片规格已不存在，无法确认`);
+  if (r.code === 'sheet_changed') {
+    return fail(res, 409, `颜色 ${r.color} 的原片规格已变化，请刷新后重试`);
+  }
+  if (r.code === 'shortage') {
+    return res.status(409).json({
+      ok: false,
+      code: 'shortage',
+      error: '铅条或玻璃库存不足，整套备料单未确认（两类库存均保持原状）',
+      leadShortage: r.lead,
+      glassShortages: r.glass,
+    });
+  }
+  res.status(201).json({ ok: true, idempotent: false, combo: serializeComboOrder(r.combo) });
+});
+
+app.get('/api/combo-orders', (req, res) => {
+  res.json({ ok: true, combos: db.listComboOrders().map(serializeComboOrder) });
+});
+
+app.get('/api/combo-orders/:comboId', (req, res) => {
+  const combo = db.getComboOrder(Number(req.params.comboId));
+  if (!combo) return fail(res, 404, '整套备料单不存在');
+  res.json({ ok: true, combo: serializeComboOrder(combo) });
+});
+
+// 取消整套单：同一事务内两类预留各释放一次；重复取消 409 且不再改库存。
+app.post('/api/combo-orders/:comboId/cancel', (req, res) => {
+  const combo = db.getComboOrder(Number(req.params.comboId));
+  if (!combo) return fail(res, 404, '整套备料单不存在');
+  const r = db.cancelComboOrder(combo.id);
+  if (r.code === 'already_canceled') {
+    return res.status(409).json({
+      ok: false, error: '整套备料单已取消，两类预留此前已各释放一次，未重复变更库存',
+      combo: serializeComboOrder(db.getComboOrder(combo.id)),
+    });
+  }
+  if (r.code === 'children_state_unexpected') {
+    return fail(res, 409, '关联计划或订单状态异常，取消未执行');
+  }
+  res.json({ ok: true, combo: serializeComboOrder(r.combo) });
+});
+
+function comboStatusZh(status) {
+  return status === 'confirmed' ? '已确认' : '已取消';
+}
+
+// 整套单输出：绑定同一发布快照与件数的铅条方案/玻璃方案，附关联计划与裁片订单。
+function serializeComboOrder(combo) {
+  const material = db.getMaterial(combo.materialId);
+  const plan = db.getPlan(combo.planId);
+  const order = db.getCutOrder(combo.cutOrderId);
+  const specs = sheetSpecMap();
+  const glassColors = colorSummaries(combo.glassLayout, specs);
+  const glassTotalShortage = glassColors.reduce((s, c) => s + c.shortage, 0);
+  return {
+    id: combo.id,
+    name: combo.name,
+    status: combo.status,
+    statusText: comboStatusZh(combo.status),
+    publicationId: combo.publicationId,
+    designId: combo.designId,
+    version: combo.version,
+    copies: combo.copies,
+    kerf: combo.kerf,
+    gap: combo.gap,
+    lead: {
+      requiredBars: combo.requiredBars,
+      segmentCount: combo.segmentCount,
+      layout: combo.leadLayout,
+      material: material
+        ? materialBrief(material)
+        : { id: combo.materialId, name: combo.materialName, length: combo.materialLength, unavailable: true },
+    },
+    glass: {
+      totalSheets: combo.totalSheets,
+      maxSheets: combo.glassLayout.maxSheets || sheetNest.MAX_SHEETS,
+      layout: combo.glassLayout,
+      colors: glassColors,
+      totalShortage: combo.status === 'confirmed' ? 0 : glassTotalShortage,
+    },
+    planId: combo.planId,
+    cutOrderId: combo.cutOrderId,
+    plan: plan ? {
+      id: plan.id,
+      name: plan.name,
+      status: plan.status,
+      statusText: statusZh(plan.status),
+      comboManaged: true,
+    } : null,
+    cutOrder: order ? {
+      id: order.id,
+      name: order.name,
+      status: order.status,
+      statusText: cutStatusZh(order.status),
+      comboManaged: true,
+    } : null,
+    idempotencyKey: combo.idempotencyKey,
+    snapshotBound: true,
+    createdAt: combo.createdAt,
+    updatedAt: combo.updatedAt,
+    confirmedAt: combo.confirmedAt,
+    canceledAt: combo.canceledAt,
+  };
+}
+
+// 前端单页
 
 // 订单输出：排样方案为建单时快照；库存视图取当前值（预览缺口仅对草稿有意义）
 function serializeCutOrder(order) {
@@ -1423,6 +1850,8 @@ function serializeCutOrder(order) {
     snapshotBound: true,
     replacedBy,
     replaces,
+    comboId: order.comboId,
+    comboManaged: !!order.comboId,
     createdAt: order.createdAt,
     updatedAt: order.updatedAt,
     confirmedAt: order.confirmedAt,

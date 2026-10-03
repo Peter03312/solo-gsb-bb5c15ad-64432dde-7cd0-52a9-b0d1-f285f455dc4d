@@ -16,6 +16,7 @@
       <button id="tabPrint" class="tab">分张打印</button>
       <button id="tabProduction" class="tab">铅条生产</button>
       <button id="tabCutting" class="tab">玻璃裁片</button>
+      <button id="tabCombo" class="tab">整套备料</button>
     </nav>
   </header>
 
@@ -331,6 +332,54 @@
       <div id="cutPreviewBox" class="lead-panel">
         <h2>排样预览 / 订单详情</h2>
         <div id="cutPreviewContent" class="hint">在左侧登记各颜色原片，选择发布版本、制作件数与片间最小间距，点击“排样预览”。</div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ============ 整套备料视图 ============ -->
+  <main id="viewCombo" class="view" hidden>
+    <aside class="panel">
+      <section>
+        <h2>① 一次备齐铅条 + 玻璃</h2>
+        <div class="hint">为同一发布版本、同一件数同时准备铅条原材（含刀损）与各色玻璃原片（含片距）。
+          预览沿用现有切段（FFD）与排样（90°旋转/左下角首次适应）规则，<b>不占库存</b>；
+          确认时两类库存<b>同一事务</b>核验并预留，任一不足全部保持原状。</div>
+        <div class="form-row">
+          <label>整套单名称<input id="comboName" type="text" placeholder="留空自动命名" maxlength="80"></label>
+        </div>
+        <label>图纸
+          <select id="comboDesignSelect"></select>
+        </label>
+        <label>发布版本
+          <select id="comboVersionSelect"></select>
+        </label>
+        <label>铅条原材
+          <select id="comboMaterialSelect"></select>
+        </label>
+        <div class="form-row two">
+          <label>件数<input id="comboCopies" type="number" min="1" step="1" value="1"></label>
+          <label>每刀损耗 (mm)<input id="comboKerf" type="number" min="0" step="0.01" value="0.5"></label>
+        </div>
+        <div class="form-row">
+          <label>玻璃片距 (mm)<input id="comboGap" type="number" min="0" max="50" step="1" value="0"></label>
+        </div>
+        <div class="btn-row">
+          <button id="btnComboPreview" class="primary big">整套用料预览（不占库存）</button>
+        </div>
+        <div id="comboMsg" class="hint"></div>
+      </section>
+
+      <section>
+        <h2>② 整套备料单</h2>
+        <div id="comboList"></div>
+      </section>
+    </aside>
+
+    <section class="canvas-wrap">
+      <div id="comboBanner" class="banner" hidden></div>
+      <div id="comboPreviewBox" class="lead-panel">
+        <h2>整套用料预览 / 单据详情</h2>
+        <div id="comboPreviewContent" class="hint">在左侧选择发布版本、件数、铅条原材与刀损、玻璃片距，点击“整套用料预览”。</div>
       </div>
     </section>
   </main>
