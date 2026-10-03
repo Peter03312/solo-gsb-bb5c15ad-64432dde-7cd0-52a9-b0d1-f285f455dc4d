@@ -711,17 +711,20 @@ function switchTab(which) {
   document.getElementById('tabPrint').classList.toggle('active', which === 'print');
   document.getElementById('tabProduction').classList.toggle('active', which === 'production');
   document.getElementById('tabCutting').classList.toggle('active', which === 'cutting');
+  document.getElementById('tabCombo').classList.toggle('active', which === 'combo');
   document.getElementById('viewDraft').hidden = which !== 'draft';
   document.getElementById('viewPublished').hidden = which !== 'published';
   document.getElementById('viewDiff').hidden = which !== 'diff';
   document.getElementById('viewPrint').hidden = which !== 'print';
   document.getElementById('viewProduction').hidden = which !== 'production';
   document.getElementById('viewCutting').hidden = which !== 'cutting';
+  document.getElementById('viewCombo').hidden = which !== 'combo';
   if (which === 'published') loadPubVersions();
   if (which === 'diff') enterDiff();
   if (which === 'print') enterPrint();
   if (which === 'production') enterProduction();
   if (which === 'cutting') enterCutting();
+  if (which === 'combo') enterCombo();
 }
 
 (async function init() {
@@ -1170,6 +1173,10 @@ function renderLayout(detail, mode) {
       ${p.status === 'confirmed' ? '✓ 已确认（库存已原子预留）' : '已取消（预留已释放）'}</div>`;
   }
 
+  if (p.comboId) {
+    html += `<div class="stock-badge replace">🔗 该计划属于整套用料单 #${p.comboId}，只能随整套单取消；此处不能单独取消、修改或删除。</div>`;
+  }
+
   html += `<div class="muted">共 ${L.totals.segmentCount} 段；成品合计 ${fmt(L.totals.finishedLength)} mm，
     刀损合计 ${fmt(L.totals.kerfTotal)} mm，余料合计 ${fmt(L.totals.remainderTotal)} mm。</div>`;
 
@@ -1189,6 +1196,8 @@ function renderLayout(detail, mode) {
 
   if (isPreview) {
     html += `<div class="btn-row"><button id="btnSaveDraft" class="primary">存为草稿计划</button></div>`;
+  } else if (p.comboId) {
+    // 整套关联计划：无任何独立操作按钮
   } else if (p.status === 'draft') {
     html += `<div class="btn-row">
       <button id="btnPlanConfirm" class="primary">确认计划（预留 ${L.requiredBars} 根）</button>
@@ -1323,8 +1332,10 @@ function renderPlanList() {
         : '<span class="badge bad">草稿</span>';
     const warn = p.status === 'draft' && p.shortage > 0
       ? ` <span class="gap-info">缺 ${p.shortage} 根</span>` : '';
+    const comboTag = p.comboId
+      ? ` <span class="muted small">🔗 整套 #${p.comboId}</span>` : '';
     return `<div class="plan-item${prod.detailPlan === p.id ? ' active' : ''}" data-id="${p.id}">
-      <div>${badge} <b>#${p.id}</b> ${escapeHtml(p.name)}${warn}</div>
+      <div>${badge} <b>#${p.id}</b> ${escapeHtml(p.name)}${warn}${comboTag}</div>
       <div class="muted small">v${p.version} · ${p.copies}件 · 用 ${p.requiredBars} 根 ·
         ${escapeHtml(p.material ? p.material.name : '规格已删')}</div>
     </div>`;
@@ -1811,6 +1822,9 @@ function cutStockBadge(p, isPreview) {
     const nb = p.replacedBy || {};
     return `<div class="stock-badge replace">⇄ 已被订单 #${nb.newOrderId || '?'} 替换（v${p.version} 的预留已退出并转给新单），不能再取消或修改</div>`;
   }
+  if (p.comboId) {
+    return `<div class="stock-badge replace">🔗 该订单属于整套用料单 #${p.comboId}，只能随整套单取消；此处不能单独取消、修改或换单。</div>`;
+  }
   return '<div class="stock-badge cancel">已取消（预留已释放）</div>';
 }
 
@@ -1861,6 +1875,8 @@ function renderCutDetail(mode) {
 
   if (isPreview) {
     html += '<div class="btn-row"><button id="btnCutSave" class="primary">存为草稿订单</button></div>';
+  } else if (p.comboId) {
+    // 整套关联订单：无独立操作按钮（确认时已预留，随整套单取消释放）
   } else if (p.status === 'draft') {
     html += `<div class="btn-row">
       <button id="btnCutConfirm" class="primary">确认订单（预留 ${p.totalSheets} 张）</button>
@@ -2145,9 +2161,10 @@ function renderCutOrderList() {
     const rel = o.status === 'replaced'
       ? ` <span class="muted small">⇄ 由 #${o.replacedBy?.newOrderId || '?'} 接替</span>`
       : o.replaces ? ` <span class="muted small">⇄ 接替 #${o.replaces.oldOrderId}</span>` : '';
+    const comboTag = o.comboId ? ` <span class="muted small">🔗 整套 #${o.comboId}</span>` : '';
     return `<div class="plan-item${cut.detailId === o.id ? ' active' : ''}" data-id="${o.id}">
       <div>${badge} <b>#${o.id}</b> ${escapeHtml(o.name)}${warn}</div>
-      <div class="muted small">v${o.version} · ${o.copies}件 · 间距 ${o.gap}mm · ${o.totalSheets} 张 ${colors}${rel}</div>
+      <div class="muted small">v${o.version} · ${o.copies}件 · 间距 ${o.gap}mm · ${o.totalSheets} 张 ${colors}${rel}${comboTag}</div>
     </div>`;
   }).join('');
   el.querySelectorAll('.plan-item').forEach((div) => {
@@ -2164,3 +2181,299 @@ document.getElementById('tabCutting').addEventListener('click', () => switchTab(
 document.getElementById('btnGlassAdd').addEventListener('click', addGlassSheet);
 document.getElementById('cutDesignSelect').addEventListener('change', loadCutVersions);
 document.getElementById('btnCutPreview').addEventListener('click', previewCutOrder);
+
+// ================= 整套备料（铅条 + 玻璃 一次备齐） =================
+
+const combo = {
+  combos: [],
+  detailId: null,
+  preview: null,
+};
+
+function comboBanner(kind, msg) {
+  const b = document.getElementById('comboBanner');
+  if (!kind) { b.hidden = true; b.textContent = ''; return; }
+  b.className = `banner ${kind === 'error' ? 'error' : 'success'}`;
+  b.hidden = false;
+  b.textContent = msg;
+  clearTimeout(comboBanner._t);
+  if (kind === 'success') comboBanner._t = setTimeout(() => { b.hidden = true; }, 3500);
+}
+
+// 生成本次确认的幂等键（重复提交/网络重试时复用，避免重复预留库存）
+function comboRequestKey() {
+  if (!combo._keyBase) {
+    combo._keyBase = 'web-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+    combo._keySeq = 0;
+  }
+  return `${combo._keyBase}-${++combo._keySeq}`;
+}
+// 同一组参数的“确认”重试应复用同一键
+combo._lastKey = null;
+
+async function enterCombo() {
+  comboBanner(false);
+  await Promise.all([refreshComboDesigns(), loadComboMaterials(), loadComboOrders()]);
+}
+
+async function loadComboMaterials() {
+  const data = await api('GET', '/api/materials');
+  const sel = document.getElementById('comboMaterialSelect');
+  const prev = sel.value;
+  sel.innerHTML = data.materials.length
+    ? data.materials.map((m) => `<option value="${m.id}">${escapeHtml(m.name)}（定尺 ${fmt(m.length)} mm，可用 ${m.available}/${m.stock} 根）</option>`).join('')
+    : '<option value="">（请先在“铅条生产”登记原材）</option>';
+  if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+}
+
+async function refreshComboDesigns() {
+  const data = await api('GET', '/api/designs');
+  const sel = document.getElementById('comboDesignSelect');
+  const prev = sel.value;
+  sel.innerHTML = '';
+  for (const d of data.designs) {
+    const opt = document.createElement('option');
+    opt.value = d.id;
+    opt.textContent = d.latest_version
+      ? `${d.name}（最新 v${d.latest_version}）`
+      : `${d.name}（暂无发布版）`;
+    sel.appendChild(opt);
+  }
+  if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+  await loadComboVersions();
+}
+
+async function loadComboVersions() {
+  const sel = document.getElementById('comboVersionSelect');
+  sel.innerHTML = '';
+  const id = Number(document.getElementById('comboDesignSelect').value);
+  if (!id) { sel.innerHTML = '<option value="">（请先选择图纸）</option>'; return; }
+  const data = await api('GET', `/api/designs/${id}/publications`);
+  if (!data.publications.length) { sel.innerHTML = '<option value="">（该图纸暂无发布版）</option>'; return; };
+  for (const p of data.publications) {
+    const opt = document.createElement('option');
+    opt.value = p.id;
+    opt.textContent = `v${p.version} · ${p.publishedAt}`;
+    sel.appendChild(opt);
+  }
+}
+
+function comboInput() {
+  return {
+    publicationId: Number(document.getElementById('comboVersionSelect').value),
+    materialId: Number(document.getElementById('comboMaterialSelect').value),
+    copies: Number(document.getElementById('comboCopies').value),
+    kerf: Number(document.getElementById('comboKerf').value),
+    gap: Number(document.getElementById('comboGap').value),
+  };
+}
+
+async function previewCombo() {
+  const body = comboInput();
+  if (!body.publicationId) { showComboHint('请先发布图纸，再选择发布版本。'); return; }
+  if (!body.materialId) { showComboHint('请先在“铅条生产”标签登记铅条原材。'); return; }
+  try {
+    const data = await api('POST', '/api/combo-orders/preview', body);
+    combo.preview = { body, data: data.preview };
+    combo._lastKey = null; // 新参数 → 新确认键
+    combo.detailId = null;
+    renderComboList();
+    renderComboPreview(data.preview);
+    comboBanner(false);
+  } catch (err) {
+    const d = err.data || {};
+    let txt = '⛔ ' + (d.error || err.message);
+    if (d.segment) txt += `（${d.segment.name}：成品 ${fmt(d.segment.length)} mm，含刀损 ${fmt(d.segment.withKerf)} mm，超过原材定尺）`;
+    if (d.code === 'piece_too_large') txt += `（拼片 #${d.pieceNo} 外接 ${d.pieceWidth}×${d.pieceHeight} mm，原片 ${d.sheetWidth}×${d.sheetHeight} mm）`;
+    comboBanner('error', txt);
+    showComboHint(txt.replace('⛔ ', ''));
+  }
+}
+
+function showComboHint(text) {
+  document.getElementById('comboPreviewContent').innerHTML = `<div class="hint">${escapeHtml(text)}</div>`;
+}
+
+function renderComboPreview(p) {
+  const leadOk = p.leadShortage === 0;
+  const glassOk = p.glass.totalShortage === 0;
+  let html = `<div class="plan-head">
+    <div><b>整套用料预览（不落库、不占库存）</b></div>
+    <div class="muted">发布版 v${p.version} · ${p.copies} 件 · 刀损 ${fmt(p.kerf)} mm · 玻璃片距 ${p.gap} mm</div></div>`;
+
+  html += `<h3>铅条</h3>
+    <div class="stock-badge ${leadOk ? 'ok' : 'bad'}">
+      ${leadOk ? '✓' : '⚠'} 原材 ${escapeHtml(p.lead.material.name)}：需用 <b>${p.lead.requiredBars}</b> 根，
+      库存 ${p.lead.stockBars} · 已预留 ${p.lead.reservedBars} · 可用 <b>${p.lead.availableBars}</b>${
+      leadOk ? '' : ` · 缺口 <b>${p.lead.shortage}</b> 根`}
+    </div>`;
+  html += '<div class="bars">';
+  for (const bar of p.lead.layout.bars) {
+    html += `<div class="bar-card">
+      <div class="bar-title">原材 #${bar.index} · 用 ${fmt(bar.usedLength)} mm · 余料 <b>${fmt(bar.remainder)}</b> mm</div>
+      <div class="bar-track">${barTrack(bar, p.lead.layout.materialLength)}</div></div>`;
+  }
+  html += '</div>';
+
+  html += `<h3>玻璃原片（共 <b>${p.glass.totalSheets}</b> 张，上限 ${p.glass.maxSheets}）</h3>
+    <div class="stock-badge ${glassOk ? 'ok' : 'bad'}">
+      ${glassOk ? '✓ 各色原片库存充足' : '⚠ 部分颜色缺口：' +
+        p.glass.colors.filter((c) => c.shortage > 0).map((c) => `${c.color} 缺 ${c.shortage}`).join('；')}
+    </div>`;
+  html += '<div class="cut-color-summary"><table><thead><tr><th>颜色</th><th class="num">原片宽×高</th><th class="num">用板</th><th class="num">库存</th><th class="num">已预留</th><th class="num">可用</th><th class="num">缺口</th></tr></thead><tbody>';
+  for (const c of p.glass.colors) {
+    html += `<tr>
+      <td><span class="color-chip" style="background:${c.color}"></span>${c.color}</td>
+      <td class="num">${c.sheetWidth}×${c.sheetHeight}</td>
+      <td class="num"><b>${c.requiredSheets}</b></td>
+      <td class="num">${c.stock}</td>
+      <td class="num">${c.reserved}</td>
+      <td class="num">${c.available}</td>
+      <td class="num">${c.shortage > 0 ? `<span class="gap-info">${c.shortage}</span>` : 0}</td>
+    </tr>`;
+  }
+  html += '</tbody></table></div>';
+
+  html += '<details><summary>查看玻璃逐张排样示意</summary><div class="cut-sheets">';
+  for (const c of p.glass.layout.colors) {
+    html += `<h4><span class="color-chip" style="background:${c.color}"></span>${c.color} · ${c.sheetWidth}×${c.sheetHeight} mm · ${c.sheets.length} 张</h4>`;
+    for (const sheet of c.sheets) {
+      html += `<div class="cut-sheet-card"><div class="bar-title">原片 #${sheet.index} · ${sheet.placements.length} 片</div>${sheetSvg(sheet, c.color)}</div>`;
+    }
+  }
+  html += '</div></details>';
+
+  if (p.feasible) {
+    html += `<div class="btn-row"><button id="btnComboConfirm" class="primary big">
+      确认整套单（同事务预留 ${p.lead.requiredBars} 根铅条 + ${p.glass.totalSheets} 张玻璃）</button></div>
+      <div class="hint">确认是原子操作：铅条或任一颜色玻璃不足都会整体失败，两类库存保持原状。网络重试请直接点同一张预览卡片的确认（幂等）。</div>`;
+  } else {
+    html += '<div class="hint">存在缺口，不能确认；请补充库存或调整件数/规格后重新预览。</div>';
+  }
+
+  document.getElementById('comboPreviewContent').innerHTML = html;
+  const btn = document.getElementById('btnComboConfirm');
+  if (btn) btn.addEventListener('click', confirmCombo);
+}
+
+async function confirmCombo() {
+  if (!combo.preview) return;
+  const { body } = combo.preview;
+  // 同一张预览的第一次确认生成键，重试复用，保证不重复预留
+  if (!combo._lastKey) combo._lastKey = comboRequestKey();
+  const name = document.getElementById('comboName').value;
+  try {
+    const data = await api('POST', '/api/combo-orders', {
+      ...body,
+      name: name || undefined,
+      requestId: combo._lastKey,
+    });
+    comboBanner('success', data.idempotent
+      ? `该整套单已确认：返回原单 #${data.combo.id}（两类库存均未重复预留）`
+      : `✓ 整套单 #${data.combo.id} 已确认：关联生产计划 #${data.combo.leadPlanId} 与裁片订单 #${data.combo.cutOrderId}`);
+    combo.preview = null;
+    await Promise.all([loadComboMaterials(), loadComboOrders(data.combo.id)]);
+  } catch (err) {
+    const d = err.data || {};
+    let txt = '⛔ ' + (d.error || err.message);
+    if (d.code === 'shortage') {
+      const parts = [];
+      if (d.lead && d.lead.shortage) parts.push(`铅条缺 ${d.lead.shortage} 根`);
+      if (Array.isArray(d.shortages)) {
+        for (const s of d.shortages) parts.push(`${s.color} 需 ${s.required}/可用 ${s.available}（缺 ${s.shortage}）`);
+      }
+      txt += '（' + parts.join('；') + '）';
+    }
+    comboBanner('error', txt);
+    await Promise.all([loadComboMaterials(), loadComboOrders()]);
+  }
+}
+
+async function loadComboOrders(selectId) {
+  const data = await api('GET', '/api/combo-orders');
+  combo.combos = data.combos;
+  renderComboList();
+  if (selectId) renderComboDetail(data.combos.find((c) => c.id === selectId) || combo.combos[0]);
+}
+
+function renderComboList() {
+  const el = document.getElementById('comboList');
+  if (!combo.combos.length) { el.innerHTML = '<div class="hint">暂无整套单。</div>'; return; }
+  el.innerHTML = combo.combos.map((c) => {
+    const badge = c.status === 'confirmed'
+      ? '<span class="badge ok">已确认</span>'
+      : '<span class="badge" style="background:#eee;color:#888">已取消</span>';
+    return `<div class="plan-item${combo.detailId === c.id ? ' active' : ''}" data-id="${c.id}">
+      <div>${badge} <b>#${c.id}</b> ${escapeHtml(c.name)}</div>
+      <div class="muted small">v${c.version} · ${c.copies}件 · 铅条 ${c.requiredBars} 根 · 玻璃 ${c.totalSheets} 张
+        · 计划 #${c.leadPlanId} / 订单 #${c.cutOrderId}</div>
+    </div>`;
+  }).join('');
+  el.querySelectorAll('.plan-item').forEach((div) => {
+    div.addEventListener('click', () => {
+      const c = combo.combos.find((x) => x.id === Number(div.dataset.id));
+      combo.detailId = c.id;
+      renderComboList();
+      renderComboDetail(c);
+    });
+  });
+}
+
+function renderComboDetail(c) {
+  const lp = c.leadPlan, co = c.cutOrder;
+  let html = `<div class="plan-head">
+    <div><b>整套单 #${c.id} · ${escapeHtml(c.name)}</b>
+      <span class="badge ${c.status === 'confirmed' ? 'ok' : ''}" style="${c.status === 'canceled' ? 'background:#eee;color:#888' : ''}">${c.statusText}</span></div>
+    <div class="muted">同一发布快照 v${c.version}（发布版 #${c.publicationId}）· ${c.copies} 件 ·
+      刀损 ${fmt(c.kerf)} mm · 玻璃片距 ${c.gap} mm ·
+      铅条 ${c.requiredBars} 根 + 玻璃 ${c.totalSheets} 张${c.canceledAt ? ' · 取消于 ' + c.canceledAt : ''}</div></div>`;
+
+  html += c.status === 'confirmed'
+    ? '<div class="stock-badge ok">✓ 两类库存已在同一事务内核验并预留；关联单不可单独取消/修改/换单</div>'
+    : '<div class="stock-badge cancel">已取消：关联生产计划与裁片订单同时取消，铅条与玻璃预留各释放一次（重复取消不重复变更）</div>';
+
+  html += `<div class="replace-info">关联生产计划：<b>#${c.leadPlanId}</b>「${escapeHtml(lp ? lp.name : '')}」（${lp ? lp.statusText : '?'}，${c.requiredBars} 根）
+    —— 仅可查阅，不能从“铅条生产”入口单独取消/修改/删除。</div>`;
+  html += `<div class="replace-info">关联裁片订单：<b>#${c.cutOrderId}</b>「${escapeHtml(co ? co.name : '')}」（${co ? co.statusText : '?'}，${c.totalSheets} 张）
+    —— 仅可查阅，不能从“玻璃裁片”入口单独取消/修改/换单/删除。</div>`;
+
+  html += '<details><summary>查看铅条切段方案</summary><div class="bars">';
+  if (lp) for (const bar of lp.layout.bars) {
+    html += `<div class="bar-card">
+      <div class="bar-title">原材 #${bar.index} · 用 ${fmt(bar.usedLength)} mm · 余料 ${fmt(bar.remainder)} mm</div>
+      <div class="bar-track">${barTrack(bar, lp.layout.materialLength)}</div></div>`;
+  }
+  html += '</div></details>';
+
+  html += '<details><summary>查看玻璃逐张排样</summary><div class="cut-sheets">';
+  if (co) for (const cc of co.layout.colors) {
+    html += `<h4><span class="color-chip" style="background:${cc.color}"></span>${cc.color} · ${cc.sheetWidth}×${cc.sheetHeight} mm · ${cc.sheets.length} 张</h4>`;
+    for (const sheet of cc.sheets) {
+      html += `<div class="cut-sheet-card"><div class="bar-title">原片 #${sheet.index} · ${sheet.placements.length} 片</div>${sheetSvg(sheet, cc.color)}</div>`;
+    }
+  }
+  html += '</div></details>';
+
+  if (c.status === 'confirmed') {
+    html += `<div class="btn-row"><button id="btnComboCancel" class="danger big">取消整套单（两类预留各释放一次）</button></div>`;
+  }
+  document.getElementById('comboPreviewContent').innerHTML = html;
+  const btn = document.getElementById('btnComboCancel');
+  if (btn) btn.addEventListener('click', () => cancelCombo(c.id));
+}
+
+async function cancelCombo(id) {
+  if (!confirm(`确定取消整套单 #${id}？关联生产计划与裁片订单将同时取消，铅条与玻璃预留各释放一次。`)) return;
+  try {
+    await api('POST', `/api/combo-orders/${id}/cancel`);
+    comboBanner('success', `✓ 整套单 #${id} 已取消，铅条与玻璃预留各释放一次`);
+    await Promise.all([loadComboMaterials(), loadComboOrders(id)]);
+  } catch (err) {
+    comboBanner('error', '⛔ ' + (err.data?.error || err.message));
+    await loadComboOrders(id);
+  }
+}
+
+document.getElementById('tabCombo').addEventListener('click', () => switchTab('combo'));
+document.getElementById('comboDesignSelect').addEventListener('change', loadComboVersions);
+document.getElementById('btnComboPreview').addEventListener('click', previewCombo);

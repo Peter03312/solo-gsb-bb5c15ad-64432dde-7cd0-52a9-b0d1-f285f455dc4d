@@ -16,6 +16,7 @@
       <button id="tabPrint" class="tab">分张打印</button>
       <button id="tabProduction" class="tab">铅条生产</button>
       <button id="tabCutting" class="tab">玻璃裁片</button>
+      <button id="tabCombo" class="tab">整套备料</button>
     </nav>
   </header>
 
@@ -331,6 +332,51 @@
       <div id="cutPreviewBox" class="lead-panel">
         <h2>排样预览 / 订单详情</h2>
         <div id="cutPreviewContent" class="hint">在左侧登记各颜色原片，选择发布版本、制作件数与片间最小间距，点击“排样预览”。</div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ============ 整套备料视图 ============ -->
+  <main id="viewCombo" class="view" hidden>
+    <aside class="panel">
+      <section>
+        <h2>① 一次备齐铅条 + 玻璃</h2>
+        <div class="form-row">
+          <label>整套单名称<input id="comboName" type="text" placeholder="留空自动命名" maxlength="80"></label>
+        </div>
+        <label>图纸
+          <select id="comboDesignSelect"></select>
+        </label>
+        <label>发布版本
+          <select id="comboVersionSelect"></select>
+        </label>
+        <label>铅条原材
+          <select id="comboMaterialSelect"></select>
+        </label>
+        <div class="form-row two">
+          <label>件数<input id="comboCopies" type="number" min="1" step="1" value="1"></label>
+          <label>每刀损耗 (mm)<input id="comboKerf" type="number" min="0" step="0.01" value="0.5"></label>
+        </div>
+        <div class="form-row">
+          <label>玻璃片间最小间距 (mm)<input id="comboGap" type="number" min="0" max="50" step="1" value="0"></label>
+        </div>
+        <div class="btn-row">
+          <button id="btnComboPreview" class="primary big">整套预览（不占库存）</button>
+        </div>
+        <div id="comboMsg" class="hint">预览沿用现有切段（FFD+刀损）与玻璃排样规则，列出铅条根数、各色原片张数、可用量与缺口，但不占库存。确认时在同一事务内核验并预留两类库存，任一不足全部保持原状。</div>
+      </section>
+
+      <section>
+        <h2>② 整套用料单</h2>
+        <div id="comboList"></div>
+      </section>
+    </aside>
+
+    <section class="canvas-wrap">
+      <div id="comboBanner" class="banner" hidden></div>
+      <div id="comboPreviewBox" class="lead-panel">
+        <h2>整套预览 / 整套单详情</h2>
+        <div id="comboPreviewContent" class="hint">在左侧选择发布版本、件数、铅条原材与刀损、玻璃片间距，点击“整套预览”。</div>
       </div>
     </section>
   </main>

@@ -74,7 +74,8 @@ function init(dbPath) {
       created_at       TEXT    NOT NULL DEFAULT (datetime('now')),
       updated_at       TEXT    NOT NULL DEFAULT (datetime('now')),
       confirmed_at     TEXT,
-      canceled_at      TEXT
+      canceled_at      TEXT,
+      combo_id         INTEGER                 -- 非空=整套单关联计划（仅随整套单取消），NULL=独立计划
     );
 
     CREATE INDEX IF NOT EXISTS idx_pieces_design ON pieces(design_id);
@@ -112,7 +113,8 @@ function init(dbPath) {
       updated_at    TEXT    NOT NULL DEFAULT (datetime('now')),
       confirmed_at  TEXT,
       canceled_at   TEXT,
-      replaced_at   TEXT
+      replaced_at   TEXT,
+      combo_id      INTEGER                   -- 非空=整套单关联订单（仅随整套单取消，禁止改/换单/删），NULL=独立订单
     );
 
     -- 换单记录：一张已确认旧单（old_order_id）在同一事务内退出预留，
@@ -142,6 +144,35 @@ function init(dbPath) {
       required_sheets INTEGER NOT NULL CHECK (required_sheets > 0)
     );
 
+    -- 整套用料单：一次确认同时预留铅条原材与各色玻璃原片。
+    -- 确认在同一事务内核验并创建“关联的生产计划 + 裁片订单”（均创建即 confirmed）；
+    -- 取消在同一事务内把两者置为 canceled，两类预留各释放一次。
+    -- request_key 为客户端幂等键：重复确认（重试）返回原整套单，不重复预留库存。
+    -- 关联的计划/订单只能随整套单存在/取消，不能从原独立入口单独取消、修改、换单或删除。
+    CREATE TABLE IF NOT EXISTS combo_orders (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      name        TEXT    NOT NULL,
+      status      TEXT    NOT NULL CHECK (status IN ('confirmed','canceled')),
+      request_key TEXT    NOT NULL UNIQUE,
+      publication_id INTEGER NOT NULL REFERENCES publications(id),
+      design_id   INTEGER NOT NULL,
+      version     INTEGER NOT NULL,
+      copies      INTEGER NOT NULL CHECK (copies > 0),
+      kerf_h      INTEGER NOT NULL CHECK (kerf_h >= 0),
+      gap_mm      INTEGER NOT NULL CHECK (gap_mm BETWEEN 0 AND 50),
+      material_id INTEGER NOT NULL REFERENCES lead_materials(id),
+      required_bars   INTEGER NOT NULL CHECK (required_bars > 0),
+      total_sheets    INTEGER NOT NULL CHECK (total_sheets BETWEEN 1 AND 60),
+      lead_plan_id    INTEGER NOT NULL,
+      cut_order_id    INTEGER NOT NULL,
+      created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+      updated_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+      canceled_at TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_combo_status ON combo_orders(status);
+    CREATE INDEX IF NOT EXISTS idx_combo_pub    ON combo_orders(publication_id);
+
     CREATE INDEX IF NOT EXISTS idx_cutorders_status ON cut_orders(status);
     CREATE INDEX IF NOT EXISTS idx_cutorders_pub    ON cut_orders(publication_id);
     CREATE INDEX IF NOT EXISTS idx_cutitems_sheet   ON cut_order_items(sheet_id);
@@ -150,9 +181,28 @@ function init(dbPath) {
 
   // 旧库迁移：早期 cut_orders 的状态 CHECK 不含 'replaced'，也没有 replaced_at 列。
   // 按 SQLite 官方表重建流程改表（保留全部行与 id；cut_order_items 通过 FK 关联，重建期间关闭 FK 检查）。
+  // 必须先于 combo_id 加列迁移：表重建不带 combo_id，随后统一补列。
   migrateCutOrders();
 
+  // 旧库迁移：早期 lead_plans / cut_orders 没有 combo_id（整套单关联）列。
+  migrateComboColumn('lead_plans');
+  migrateComboColumn('cut_orders');
+  // 关联列索引（新库/旧库统一在此创建，确保列已存在）
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_plans_combo ON lead_plans(combo_id);
+    CREATE INDEX IF NOT EXISTS idx_cutorders_combo ON cut_orders(combo_id);
+  `);
+
   return db;
+}
+
+// 为旧库补 combo_id 列（NULL = 独立计划/订单；非空 = 属于某整套单，受整单状态机约束）。
+// 不建 FK 约束（整套单与关联单在同一事务内先后插入，且历史表不带该列），由应用层保证一致。
+function migrateComboColumn(table) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+  if (cols.length > 0 && !cols.includes('combo_id')) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN combo_id INTEGER`);
+  }
 }
 
 function migrateCutOrders() {
@@ -484,6 +534,7 @@ function rowToPlan(row) {
     updatedAt: row.updated_at,
     confirmedAt: row.confirmed_at || null,
     canceledAt: row.canceled_at || null,
+    comboId: row.combo_id ?? null,
   };
 }
 
@@ -498,6 +549,7 @@ function listPlans() {
 function updatePlanDraft(id, p) {
   const row = getPlanRow(id);
   if (!row) return { code: 'not_found' };
+  if (row.combo_id) return { code: 'combo_locked', comboId: row.combo_id };
   if (row.status !== 'draft') return { code: 'not_draft', status: row.status };
   getDb()
     .prepare(`UPDATE lead_plans SET
@@ -518,6 +570,7 @@ function confirmPlan(id) {
   try {
     const row = getPlanRow(id);
     if (!row) { d.exec('ROLLBACK'); return { code: 'not_found' }; }
+    if (row.combo_id) { d.exec('ROLLBACK'); return { code: 'combo_locked', comboId: row.combo_id }; }
     if (row.status === 'confirmed') { d.exec('ROLLBACK'); return { code: 'already_confirmed' }; }
     if (row.status === 'canceled') { d.exec('ROLLBACK'); return { code: 'plan_canceled' }; }
 
@@ -551,6 +604,7 @@ function cancelPlan(id) {
   const d = getDb();
   const row = getPlanRow(id);
   if (!row) return { code: 'not_found' };
+  if (row.combo_id) return { code: 'combo_locked', comboId: row.combo_id };
   if (row.status === 'draft') return { code: 'draft_not_reserved' };
   if (row.status === 'canceled') return { code: 'already_canceled' };
   d.exec('BEGIN IMMEDIATE');
@@ -569,6 +623,7 @@ function cancelPlan(id) {
 function deletePlan(id) {
   const row = getPlanRow(id);
   if (!row) return { code: 'not_found' };
+  if (row.combo_id) return { code: 'combo_locked', comboId: row.combo_id };
   if (row.status === 'confirmed') return { code: 'confirmed_delete_blocked' };
   getDb().prepare('DELETE FROM lead_plans WHERE id = ?').run(id);
   return { code: 'ok' };
@@ -679,6 +734,7 @@ function rowToCutOrder(row) {
     confirmedAt: row.confirmed_at || null,
     canceledAt: row.canceled_at || null,
     replacedAt: row.replaced_at || null,
+    comboId: row.combo_id ?? null,
   };
 }
 
@@ -732,6 +788,7 @@ function updateCutOrderDraft(id, o) {
   const txn = d.transaction(() => {
     const row = getCutOrderRow(id);
     if (!row) return { code: 'not_found' };
+    if (row.combo_id) return { code: 'combo_locked', comboId: row.combo_id };
     if (row.status !== 'draft') return { code: 'not_draft', status: row.status };
     d.prepare(`UPDATE cut_orders SET
        name = ?, publication_id = ?, design_id = ?, version = ?, copies = ?, gap_mm = ?,
@@ -758,6 +815,7 @@ function confirmCutOrder(id) {
   try {
     const row = getCutOrderRow(id);
     if (!row) { d.exec('ROLLBACK'); return { code: 'not_found' }; }
+    if (row.combo_id) { d.exec('ROLLBACK'); return { code: 'combo_locked', comboId: row.combo_id }; }
     if (row.status === 'confirmed') { d.exec('ROLLBACK'); return { code: 'already_confirmed' }; }
     if (row.status === 'canceled') { d.exec('ROLLBACK'); return { code: 'order_canceled' }; }
     if (row.status === 'replaced') { d.exec('ROLLBACK'); return { code: 'order_replaced' }; }
@@ -809,6 +867,7 @@ function cancelCutOrder(id) {
   const d = getDb();
   const row = getCutOrderRow(id);
   if (!row) return { code: 'not_found' };
+  if (row.combo_id) return { code: 'combo_locked', comboId: row.combo_id };
   if (row.status === 'draft') return { code: 'draft_not_reserved' };
   if (row.status === 'canceled') return { code: 'already_canceled' };
   if (row.status === 'replaced') return { code: 'order_replaced' };
@@ -828,6 +887,7 @@ function cancelCutOrder(id) {
 function deleteCutOrder(id) {
   const row = getCutOrderRow(id);
   if (!row) return { code: 'not_found' };
+  if (row.combo_id) return { code: 'combo_locked', comboId: row.combo_id };
   if (row.status === 'confirmed') return { code: 'confirmed_delete_blocked' };
   if (row.status === 'replaced') return { code: 'replaced_delete_blocked' };
   getDb().prepare('DELETE FROM cut_orders WHERE id = ?').run(id); // 子表 ON DELETE CASCADE
@@ -861,6 +921,7 @@ function replaceCutOrder(oldId, o) {
   try {
     const oldRow = getCutOrderRow(oldId);
     if (!oldRow) { d.exec('ROLLBACK'); return { code: 'not_found' }; }
+    if (oldRow.combo_id) { d.exec('ROLLBACK'); return { code: 'combo_locked', comboId: oldRow.combo_id }; }
 
     // 已换过（旧单此时为 replaced）：相同参数幂等返回原新单；不同参数冲突。
     // 必须先于状态检查，保证“对同一旧单按相同参数重试返回原新单”。
@@ -960,6 +1021,207 @@ function replaceCutOrder(oldId, o) {
   }
 }
 
+// ---------- 整套用料单（铅条 + 玻璃 同一事务一次性核验并预留） ----------
+
+function rowToComboOrder(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    name: row.name,
+    status: row.status,
+    requestKey: row.request_key,
+    publicationId: row.publication_id,
+    designId: row.design_id,
+    version: row.version,
+    copies: row.copies,
+    kerf: row.kerf_h / 100,
+    gap: row.gap_mm,
+    materialId: row.material_id,
+    requiredBars: row.required_bars,
+    totalSheets: row.total_sheets,
+    leadPlanId: row.lead_plan_id,
+    cutOrderId: row.cut_order_id,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    canceledAt: row.canceled_at || null,
+  };
+}
+
+function getComboOrderRow(id) {
+  return getDb().prepare('SELECT * FROM combo_orders WHERE id = ?').get(id);
+}
+
+function getComboOrder(id) {
+  return rowToComboOrder(getComboOrderRow(id));
+}
+
+function getComboOrderByRequestKey(requestKey) {
+  const row = getDb().prepare('SELECT * FROM combo_orders WHERE request_key = ?').get(requestKey);
+  return row ? rowToComboOrder(row) : null;
+}
+
+function listComboOrders() {
+  return getDb().prepare('SELECT * FROM combo_orders ORDER BY id DESC').all().map(rowToComboOrder);
+}
+
+// 确认整套单：一个 BEGIN IMMEDIATE 事务内
+//   1) request_key 已存在：参数一致幂等返回原单；不一致返回 request_conflict；
+//   2) 铅条原材：定尺身份核对 + 库存核对；
+//   3) 玻璃各色：规格宽高身份核对 + 逐色库存核对；
+//   4) 任一不足 → 回滚，两类库存、任何记录全部保持原状，返回铅条/各色缺口；
+//   5) 充足 → 创建即 confirmed 的关联生产计划、关联裁片订单（含分色项）与整套单，原子提交。
+// 参数 c:
+//   { name, requestKey, publicationId, designId, version, copies, kerfH, gap,
+//     materialId, materialName, materialLengthH, requiredBars, segmentCount, leadLayout,
+//     totalSheets, nestLayout, items }
+function createComboOrder(c) {
+  const d = getDb();
+  d.exec('BEGIN IMMEDIATE');
+  try {
+    // 幂等 / 冲突（不重复排样、不重复预留）
+    const dup = d.prepare('SELECT * FROM combo_orders WHERE request_key = ?').get(c.requestKey);
+    if (dup) {
+      d.exec('ROLLBACK');
+      const same = dup.publication_id === c.publicationId &&
+        dup.material_id === c.materialId &&
+        dup.copies === c.copies && dup.kerf_h === c.kerfH && dup.gap_mm === c.gap;
+      if (!same) {
+        return {
+          code: 'request_conflict',
+          comboId: dup.id,
+          current: {
+            publicationId: dup.publication_id, materialId: dup.material_id,
+            copies: dup.copies, kerf: dup.kerf_h / 100, gap: dup.gap_mm,
+          },
+        };
+      }
+      return { code: 'idempotent', combo: rowToComboOrder(dup) };
+    }
+
+    // ---- 铅条：身份与库存 ----
+    const mat = getMaterialRow(c.materialId);
+    if (!mat) { d.exec('ROLLBACK'); return { code: 'material_missing' }; }
+    if (mat.length_h !== c.materialLengthH) { d.exec('ROLLBACK'); return { code: 'material_changed' }; }
+    const leadReserved = d
+      .prepare("SELECT COALESCE(SUM(required_bars),0) AS n FROM lead_plans WHERE material_id = ? AND status = 'confirmed'")
+      .get(c.materialId).n;
+    const leadAvailable = mat.stock - leadReserved;
+    if (c.requiredBars > leadAvailable) {
+      d.exec('ROLLBACK');
+      return {
+        code: 'shortage',
+        lead: { required: c.requiredBars, available: leadAvailable, shortage: c.requiredBars - leadAvailable },
+        glass: [],
+      };
+    }
+
+    // ---- 玻璃：逐色身份与库存 ----
+    const glassShortages = [];
+    for (const it of c.items) {
+      const sheet = getGlassSheetRow(it.sheetId);
+      if (!sheet) { d.exec('ROLLBACK'); return { code: 'sheet_missing', color: it.color }; }
+      if (sheet.width_mm !== it.width || sheet.height_mm !== it.height) {
+        d.exec('ROLLBACK'); return { code: 'sheet_changed', color: it.color };
+      }
+      const reserved = d
+        .prepare(`SELECT COALESCE(SUM(ci.required_sheets),0) AS n
+                  FROM cut_order_items ci JOIN cut_orders co ON co.id = ci.order_id
+                  WHERE ci.sheet_id = ? AND co.status = 'confirmed'`).get(it.sheetId).n;
+      const available = sheet.stock - reserved;
+      if (it.requiredSheets > available) {
+        glassShortages.push({
+          color: it.color, required: it.requiredSheets,
+          available, shortage: it.requiredSheets - available,
+        });
+      }
+    }
+    if (glassShortages.length) {
+      d.exec('ROLLBACK');
+      return {
+        code: 'shortage',
+        lead: { required: c.requiredBars, available: leadAvailable, shortage: 0 },
+        glass: glassShortages,
+      };
+    }
+
+    // ---- 充足：创建关联生产计划（即 confirmed） ----
+    const planInfo = d.prepare(`INSERT INTO lead_plans
+      (name, status, publication_id, design_id, version, material_id, material_name,
+       material_length_h, copies, kerf_h, required_bars, segment_count, layout, confirmed_at, combo_id)
+      VALUES (?, 'confirmed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), NULL)`)
+      .run(c.leadName, c.publicationId, c.designId, c.version, c.materialId,
+        c.materialName, c.materialLengthH, c.copies, c.kerfH, c.requiredBars,
+        c.segmentCount, JSON.stringify(c.leadLayout));
+    const planId = planInfo.lastInsertRowid;
+
+    // ---- 创建关联裁片订单（即 confirmed） ----
+    const orderInfo = d.prepare(`INSERT INTO cut_orders
+      (name, status, publication_id, design_id, version, copies, gap_mm, total_sheets, layout, confirmed_at, combo_id)
+      VALUES (?, 'confirmed', ?, ?, ?, ?, ?, ?, ?, datetime('now'), NULL)`)
+      .run(c.orderName, c.publicationId, c.designId, c.version, c.copies, c.gap,
+        c.totalSheets, JSON.stringify(c.nestLayout));
+    const orderId = orderInfo.lastInsertRowid;
+
+    const insItem = d.prepare(`INSERT INTO cut_order_items
+      (order_id, sheet_id, sheet_color, sheet_width_mm, sheet_height_mm, required_sheets)
+      VALUES (?, ?, ?, ?, ?, ?)`);
+    for (const it of c.items) {
+      insItem.run(orderId, it.sheetId, it.color, it.width, it.height, it.requiredSheets);
+    }
+
+    // ---- 整套单（回填两个关联 id） ----
+    const comboInfo = d.prepare(`INSERT INTO combo_orders
+      (name, status, request_key, publication_id, design_id, version, copies, kerf_h, gap_mm,
+       material_id, required_bars, total_sheets, lead_plan_id, cut_order_id)
+      VALUES (?, 'confirmed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(c.name, c.requestKey, c.publicationId, c.designId, c.version,
+        c.copies, c.kerfH, c.gap, c.materialId, c.requiredBars, c.totalSheets, planId, orderId);
+    const comboId = comboInfo.lastInsertRowid;
+
+    d.prepare('UPDATE lead_plans SET combo_id = ? WHERE id = ?').run(comboId, planId);
+    d.prepare('UPDATE cut_orders SET combo_id = ? WHERE id = ?').run(comboId, orderId);
+
+    d.exec('COMMIT');
+    return { code: 'ok', combo: getComboOrder(comboId) };
+  } catch (e) {
+    d.exec('ROLLBACK');
+    throw e;
+  }
+}
+
+// 取消整套单：同一事务把关联生产计划与裁片订单同时置为 canceled，
+// 两类预留各释放一次；重复取消不重复变更库存。
+function cancelComboOrder(id) {
+  const d = getDb();
+  const row = getComboOrderRow(id);
+  if (!row) return { code: 'not_found' };
+  if (row.status === 'canceled') return { code: 'already_canceled' };
+  d.exec('BEGIN IMMEDIATE');
+  try {
+    // 事务内重读状态，防止并发重复取消
+    const cur = d.prepare('SELECT * FROM combo_orders WHERE id = ?').get(id);
+    if (cur.status === 'canceled') { d.exec('ROLLBACK'); return { code: 'already_canceled' }; }
+
+    const pn = d.prepare(`UPDATE lead_plans
+      SET status = 'canceled', canceled_at = datetime('now'), updated_at = datetime('now')
+      WHERE id = ? AND combo_id = ? AND status = 'confirmed'`).run(cur.lead_plan_id, id);
+    const on = d.prepare(`UPDATE cut_orders
+      SET status = 'canceled', canceled_at = datetime('now'), updated_at = datetime('now')
+      WHERE id = ? AND combo_id = ? AND status = 'confirmed'`).run(cur.cut_order_id, id);
+    if (pn.changes !== 1 || on.changes !== 1) {
+      throw new Error('整套单关联记录状态异常，取消已回滚');
+    }
+    d.prepare(`UPDATE combo_orders
+      SET status = 'canceled', canceled_at = datetime('now'), updated_at = datetime('now')
+      WHERE id = ?`).run(id);
+    d.exec('COMMIT');
+    return { code: 'ok', combo: getComboOrder(id) };
+  } catch (e) {
+    d.exec('ROLLBACK');
+    throw e;
+  }
+}
+
 module.exports = {
   init, getDb,
   createDesign, getDesign, listDesigns,
@@ -972,4 +1234,5 @@ module.exports = {
   createCutOrder, getCutOrder, listCutOrders, listCutOrderItems, updateCutOrderDraft,
   confirmCutOrder, cancelCutOrder, deleteCutOrder,
   getReplacementByOldOrder, getReplacementByNewOrder, replaceCutOrder,
+  createComboOrder, getComboOrder, listComboOrders, cancelComboOrder,
 };

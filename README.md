@@ -12,6 +12,8 @@
 
 已确认的裁片订单在客户改图后还可**换单**：从一张已确认订单换到**同一图纸的另一已发布版本**，重新输入件数与片间距；换单预览按颜色对比旧单与新排样的**用板数、净增减、计入旧单退出预留后的可用量与缺口**（预览不占库存）。确认换单在**同一事务**内让旧单退出预留并确认新单，任一颜色不足则旧单、库存与订单记录**全部保持原状**；成功后旧单标记**已替换**（快照与排样仍可查，但不能再取消/修改/删除），新单为独立的已确认订单；对同一旧单按相同参数重试**返回原新单**，不同参数报冲突，均不重复预留。
 
+工作室为同一发布图纸备料时还可下**整套用料单**：一次选择发布版本、件数、铅条原材与刀损、玻璃片距；预览沿用现有铅条切段与玻璃排样规则，列出**铅条需用根数、各色原片用板张数、可用量与缺口**（不占库存）。确认时在**同一事务**内核验并预留两类库存，**任一不足全部保持原状**；成功后生成绑定同一发布快照与件数的**关联生产计划与裁片订单**。整套单取消时两类预留**各释放一次**；关联单**不能从原入口单独取消、修改、换单或删除**，重复确认/取消均不重复变更库存；原有的独立计划、订单及其接口继续可用。
+
 ## 功能一览
 
 - **窗框建模**：宽、高为正整数毫米（1–100000）。
@@ -63,6 +65,14 @@
   - **幂等与快照**：重复确认不重复预留；取消只释放一次（重复取消返回 409 且不再改库存）；已确认订单不可改、不可删（须先取消）；订单永久绑定发布快照，草稿改动或再发布均不改变已确认方案。
   - **换单（本轮新增）**：仅**已确认**订单可换；选择**同一图纸的另一已发布版本**与新件数/片间距，预览按颜色列出**旧单用板/新排样用板/净增减/计入旧单退出预留后的可用量/缺口**（只读不占库存）；确认在一个 `BEGIN IMMEDIATE` 事务内**旧单退出预留 + 新单创建即确认**，任一颜色不足整体回滚并返回各色缺口；成功后旧单置为**已替换**（保留发布快照与排样，不可再取消/修改/删除），新单是独立已确认订单、可继续取消或再次换单（形成换单链）；同一旧单相同参数重试**幂等返回原新单**、不同参数返回 409 冲突，均不重复预留。
   - 网页“玻璃裁片”标签可登记原片、排样预览、存草稿、确认/取消订单并查看逐张排样示意；已确认订单详情内展开“换单”面板即可查看换单预览并确认换单。
+- **整套用料单（本轮新增）**：
+  - **一次备齐**：选择发布版本、件数、铅条原材与每刀损耗、玻璃片间最小间距；**整套预览**沿用现有切段（FFD + 刀损）与玻璃排样规则，列出铅条**需用根数**、**各色原片用板张数**、各自**库存/已预留/可用/缺口**与总缺口；预览**不落库、不占库存**，几何/缺色/超 60 张等整单拒绝规则不变。
+  - **原子确认**：确认在一个 `BEGIN IMMEDIATE` 事务内同时核验铅条原材与各色玻璃原片，**铅条或任一颜色不足即整体回滚**（409 `shortage`，返回铅条与每色缺口），两类库存、计划/订单记录**全部保持原状**；成功后同事务生成**关联生产计划 + 关联裁片订单**（均创建即已确认），二者绑定**同一发布快照与同一件数**。
+  - **幂等**：确认须带 `requestId` 幂等键；同键重试**返回原整套单**（不重复预留），同键不同参数返回 409 `request_conflict`；多客户端并发由写事务串行化，**两类库存都不超卖**。
+  - **取消**：整套单取消在一个事务内把关联计划与订单同时置为已取消，**铅条与玻璃预留各释放一次**；重复取消返回 409 且不重复变更库存。
+  - **关联单保护**：关联生产计划不能从 `/api/plans` 入口单独确认/取消/修改/删除；关联裁片订单不能从 `/api/cut-orders` 入口单独确认/取消/修改/删除/换单（均 409 `combo_locked`，只读详情仍可查），防止状态分叉。
+  - **独立性**：原有独立铅条计划、独立裁片订单（含换单）的全部接口与网页入口**继续可用、互不影响**；独立单 `comboId` 为 `null`。
+  - 网页新增“整套备料”标签：整套预览（含逐根切段与逐色/逐张排样示意）、一键原子确认、整套单列表与详情、取消整套单；“铅条生产/玻璃裁片”列表中关联单带 🔗 标记且无独立操作按钮。
 
 ## 技术栈
 
@@ -172,6 +182,11 @@ Compose 中通过命名卷 `studio-data` 持久化 `/data`；改宿主机端口�
 | POST | `/api/cut-orders/:id/replacement/preview` | 换单预览 `{targetPublicationId 或 targetVersion, copies?, gap?}`（只读，不占库存） |
 | POST | `/api/cut-orders/:id/replacement` | 确认换单（同事务旧单退出预留+新单确认；相同参数幂等返回原新单，不同参数 409） |
 | DELETE | `/api/cut-orders/:id` | 删除草稿/已取消订单（已确认须先取消；已替换不可删） |
+| POST | `/api/combo-orders/preview` | 整套用料预览 `{publicationId,materialId,copies,kerf,gap}`（铅条根数+各色张数/可用/缺口；不落库、不占库存） |
+| POST | `/api/combo-orders` | 确认整套单 `{...,requestId,name?}`（同事务核验并预留两类库存，任一不足全部回滚；同 requestId 重试幂等） |
+| GET | `/api/combo-orders` | 整套单列表（含状态/关联计划与订单） |
+| GET | `/api/combo-orders/:id` | 整套单详情（关联生产计划、裁片订单、两套方案快照） |
+| POST | `/api/combo-orders/:id/cancel` | 取消整套单（同事务取消两个关联单，两类预留各释放一次；重复取消 409） |
 
 校验失败统一返回：
 
@@ -192,6 +207,7 @@ Compose 中通过命名卷 `studio-data` 持久化 `/data`；改宿主机端口�
 8. 切到“铅条生产”标签：登记原材定尺与库存根数 → 选发布版本/件数/原材/每刀损耗 → “排产预览”查看逐根切段与余料 → “存为草稿计划” → 库存足够时“确认计划”原子预留；需要退料时“取消计划”释放预留。
 9. 切到“分张打印”标签：选图纸与已发布版本 → 输入纸张宽高、四边留白与相邻页重叠（整数毫米）→ “生成拼接预览”查看行列总页数、每页覆盖坐标与拼接标记 → 逐页或一键“逐页下载全部 SVG”，打印时选择“实际大小/100%”，按重叠带与红色对位十字现场拼接。
 10. 切到“玻璃裁片”标签：按颜色登记原片宽×高（1–2000 整数 mm）与库存张数 → 选发布版本、制作件数与片间最小间距 → “排样预览”查看逐张原片的片号/件次/旋转/坐标/轮廓与各色用板、库存缺口 → “存为草稿订单” → 库存充足时“确认订单”原子预留所有颜色；需要退料时“取消订单”一次性释放。客户改图并再次发布后，打开**已确认订单**详情、展开底部“⇄ 换单”面板 → 选同一图纸的新版本、件数与片间距 → “换单预览”核对各色旧/新用板、净增减与旧单释放后的可用量 → “确认换单”原子完成（旧单变“已替换”，新单即确认）；相同参数重复提交会返回原新单。
+11. 切到“整套备料”标签：选发布版本、件数、铅条原材与刀损、玻璃片距 → “整套预览”一次看清铅条根数与各色原片张数的可用/缺口（不占库存）→ “确认整套单”在同一事务预留两类库存并生成绑定同一快照与件数的关联生产计划、裁片订单；退料时在整套单详情“取消整套单”，两类预留各释放一次。关联单在“铅条生产/玻璃裁片”中带 🔗 标记，只能查阅、不能单独操作。
 
 ## 玻璃裁片排样规则
 
@@ -356,6 +372,104 @@ curl -s -X POST localhost:3000/api/cut-orders/7/replacement/preview \
 #         "oldOrder":{...仍为 confirmed、version:1...}}
 ```
 
+## 整套用料单规则（铅条 + 玻璃 一次备齐）
+
+- **用途**：工作室为同一发布图纸同时备齐铅条与玻璃时，一次确认整套用料，避免“铅条已预留、玻璃却不够”的半成状态。
+- **入参**：`publicationId`（不可变发布版）、`materialId`（铅条原材规格）、`copies` 件数（正整数，≤10000）、`kerf` 每刀损耗（≥0，精确到 0.01 mm）、`gap` 玻璃片间最小间距（0–50 整数毫米）。铅条切段与玻璃排样**完全沿用各自现有规则**（内部公共边+四框、FFD+刀损；90°旋转/整数平移、不镜像、不越板、净距 ≥ gap，总用板 ≤ 60）。
+- **预览只读**：`POST /api/combo-orders/preview` 返回
+  - `lead`：原材、`requiredBars` 需用根数、`stockBars/reservedBars/availableBars`、`shortage` 与逐根切段 `layout`；
+  - `glass`：分色 `requiredSheets/stock/reserved/available/shortage`、`totalSheets/totalShortage` 与逐张排样 `layout`；
+  - 顶层 `leadShortage/totalShortage/feasible`。预览**不落库、不占库存**；几何类整单拒绝（`segment_too_long`/`missing_color`/`piece_too_large`/`too_many_sheets`）状态码与原接口一致。
+- **原子确认**：`POST /api/combo-orders` 须额外携带 `requestId`（1–80 个字母/数字/`._:-`）作为**客户端幂等键**。服务端在一个 `BEGIN IMMEDIATE` 事务内：
+  1. 铅条原材定尺身份核对、库存核对（`available = stock − 所有已确认计划预留`，含其他独立计划与其他整套单的关联计划）；
+  2. 玻璃逐色规格身份核对、库存核对（`available = stock − 所有已确认订单分色预留`，含独立订单与其他整套单的关联订单）；
+  3. **任一不足 → 回滚**：409 `shortage`，`lead:{required,available,shortage}` 与 `shortages:[{color,required,available,shortage}]`，两类库存与任何记录保持原状，绝不留下半套预留；
+  4. 充足 → 同事务插入一张**已确认关联生产计划**、一张**已确认关联裁片订单**（含分色项）与整套单记录并互相回填 id，原子提交。
+- **幂等与并发**：同一 `requestId` 重试返回原整套单（200，`idempotent:true`，不重新排样、不重复预留）；同一 `requestId` 但版本/原材/件数/刀损/间距不同 → 409 `request_conflict`（附首次提交的 `current` 参数）。并发确认由写事务串行化，铅条根数与各色张数**均不超卖**。
+- **取消（各释放一次）**：`POST /api/combo-orders/:id/cancel` 在一个事务内把关联计划与关联订单同时置为 `canceled`：铅条预留随计划状态释放、各色玻璃预留随订单状态释放（复用既有库存口径，状态机保证各计一次）；重复取消返回 409 且库存不重复变化。取消后关联单记录保留可查，仍不可删除。
+- **关联单保护（防状态分叉）**：关联计划与关联订单只能随整套单确认/取消：
+  - 铅条侧：`PUT/DELETE /api/plans/:id`、`POST /api/plans/:id/confirm|cancel` 一律 409 `combo_locked`；
+  - 玻璃侧：`PUT/DELETE /api/cut-orders/:id`、`POST /api/cut-orders/:id/confirm|cancel`、`.../replacement` 与 `.../replacement/preview` 一律 409 `combo_locked`；
+  - 只读接口 `GET /api/plans/:id`、`GET /api/cut-orders/:id` 照常，返回体新增 `comboId`/`comboLocked`（独立单为 `null`/`false`）。
+- **快照绑定**：整套单及其两个关联单均绑定同一 `publicationId`；草稿改动、再发布均不影响已确认用料。
+- **独立入口不受影响**：原有独立生产计划、独立裁片订单与换单的全部接口、网页与库存口径保持不变；两类库存视图（`/api/materials`、`/api/glass-sheets`）的 `reserved/available` 已自动把整套单的关联预留计入。
+
+### 整套用料单调用示例（curl）
+
+```bash
+# 0) 前置：登记铅条原材与各色玻璃原片（沿用原接口）
+curl -s localhost:3000/api/materials -H 'Content-Type: application/json' \
+  -d '{"name":"6m 通用铅条","length":6000,"stock":10}'
+curl -s localhost:3000/api/glass-sheets -H 'Content-Type: application/json' \
+  -d '{"color":"#ff0000","width":600,"height":400,"stock":8}'
+curl -s localhost:3000/api/glass-sheets -H 'Content-Type: application/json' \
+  -d '{"color":"#00ff00","width":600,"height":400,"stock":4}'
+
+# 1) 整套预览（不落库、不占库存）
+curl -s localhost:3000/api/combo-orders/preview -H 'Content-Type: application/json' \
+  -d '{"publicationId":1,"materialId":1,"copies":2,"kerf":0.5,"gap":4}'
+# -> { ok:true, preview:{
+#      publicationId, version, copies, kerf, gap,
+#      lead:{ material:{...}, requiredBars:1, stockBars:10, reservedBars:0,
+#             availableBars:10, shortage:0, layout:{bars:[...]} },
+#      glass:{ totalSheets:4, maxSheets:60, totalShortage:0,
+#              colors:[{color:"#ff0000",requiredSheets:2,stock,reserved,available,shortage:0},
+#                      {color:"#00ff00",requiredSheets:2,...}], layout:{colors:[...]} },
+#      leadShortage:0, totalShortage:0, feasible:true } }
+
+# 2) 确认整套单（同事务预留两类库存；requestId 用于网络重试幂等）
+curl -s localhost:3000/api/combo-orders -H 'Content-Type: application/json' \
+  -d '{"name":"三联窗整套","publicationId":1,"materialId":1,
+       "copies":2,"kerf":0.5,"gap":4,"requestId":"order-20261003-0001"}'
+# -> 201 { ok:true, idempotent:false, combo:{
+#      id:1, status:"confirmed", version:1, copies:2, kerf:0.5, gap:4,
+#      requiredBars:1, totalSheets:4,
+#      leadPlanId:10, cutOrderId:11, snapshotBound:true,
+#      leadPlan:{ id:10, status:"confirmed", comboId:1, ... },
+#      cutOrder:{ id:11, status:"confirmed", comboId:1, ... } } }
+
+# 3) 网络重试 / 重复确认：相同 requestId 返回原单（不重复预留）
+curl -s localhost:3000/api/combo-orders -H 'Content-Type: application/json' \
+  -d '{"publicationId":1,"materialId":1,"copies":2,"kerf":0.5,"gap":4,
+       "requestId":"order-20261003-0001"}'
+# -> 200 { ok:true, idempotent:true, combo:{ id:1, ... } }
+
+# 4) 查询整套单列表 / 详情
+curl -s localhost:3000/api/combo-orders
+curl -s localhost:3000/api/combo-orders/1
+
+# 5) 取消整套单：两个关联单同时取消，铅条与玻璃预留各释放一次
+curl -s -X POST localhost:3000/api/combo-orders/1/cancel
+# -> { ok:true, combo:{ status:"canceled", leadPlan:{status:"canceled"}, cutOrder:{status:"canceled"} } }
+curl -s -X POST localhost:3000/api/combo-orders/1/cancel
+# -> 409 整套单已取消…未重复变更库存
+```
+
+失败与锁定示例（库存与记录均保持原状）：
+
+```bash
+# 缺少幂等键
+# -> 400 {"ok":false,"error":"requestId 必填：…"}
+
+# 铅条或玻璃不足（绿色可用 0、需 2 张）
+# -> 409 {"ok":false,"code":"shortage",
+#         "lead":{"required":1,"available":10,"shortage":0},
+#         "shortages":[{"color":"#00ff00","required":2,"available":0,"shortage":1}]}
+
+# 同一 requestId 不同参数
+# -> 409 {"ok":false,"code":"request_conflict","comboId":1,
+#         "current":{"publicationId":1,"materialId":1,"copies":2,"kerf":0.5,"gap":4}}
+
+# 从原入口操作关联单（计划 #10 / 订单 #11 属于整套 #1）
+curl -s -X POST localhost:3000/api/plans/10/cancel
+# -> 409 {"ok":false,"code":"combo_locked","comboId":1,
+#         "error":"该计划属于整套用料单 #1，取消整套单时会一并释放铅条预留，不能单独取消"}
+curl -s -X POST localhost:3000/api/cut-orders/11/replacement/preview \
+  -H 'Content-Type: application/json' -d '{"targetVersion":2}'
+# -> 409 {"ok":false,"code":"combo_locked","comboId":1,...}
+# 只读详情仍可查：GET /api/plans/10、GET /api/cut-orders/11（comboId:1）
+```
+
 ## 铅条生产排产规则
 
 - **长度单位**：所有长度（定尺、切段、刀损、余料）内部都以 **0.01 mm 的整数倍**精确运算，接口接受至多两位小数的毫米数；超过精度（如 `6000.005`）直接拒绝。
@@ -511,15 +625,15 @@ curl -s localhost:3000/api/materials
 Dockerfile               容器镜像（含 better-sqlite3 编译环境）
 docker-compose.yml       一键启动 + 数据卷持久化
 src/
-  server.js              Express 入口与 API（图纸/发布/两版核对/原材/生产计划/玻璃裁片/裁片换单）
-  db.js                  SQLite 初始化与数据访问（含铅条与玻璃原片的原子预留事务、裁片换单原子事务）
+  server.js              Express 入口与 API（图纸/发布/两版核对/原材/生产计划/玻璃裁片/裁片换单/整套用料单）
+  db.js                  SQLite 初始化与数据访问（铅条与玻璃原片原子预留、裁片换单与整套单原子事务；旧库自动迁移）
   geometry.js            精确几何校验、覆盖/缺口分析、铅条合并
   leaddiff.js            两版铅条核对（整数直线分组、区间沿用/取消/新增、拆分）
   cutting.js             铅条切段排产（0.01mm 整数运算、FFD、刀损）
   printsheet.js          1:1 分张打印（整数毫米分页、拼接标记、逐页 SVG/毫米标尺）
   sheetnest.js           玻璃裁片排样（整数/BigInt 精确净距、90°旋转、左下角首次适应、60 张上限）
 public/
-  index.html / style.css / app.js   单页前端（Canvas 编辑器/发布视图/版本核对/分张打印/铅条生产/玻璃裁片）
+  index.html / style.css / app.js   单页前端（Canvas 编辑器/发布视图/版本核对/分张打印/铅条生产/玻璃裁片/整套备料）
 test/
   geometry.test.js       几何算法测试（node --test）
   leaddiff.test.js       两版核对：反向/顺序/T接归一、部分重叠拆分、斜向合计舍入、非同图纸报错
@@ -530,5 +644,6 @@ test/
   diff.api.test.js       两版核对端到端测试（GET/POST、404/400、只读不改变快照/计划/库存）
   sheetnest.test.js      裁片排样算法测试（旋转/越板/精确净距/缺色/上限/件次/确定性）
   cutorders.api.test.js  裁片订单端到端（登记/预览/整单拒绝、多色原子预留、并发不超卖、快照绑定）
-  cutreplace.api.test.js 换单端到端（预览只读、原子换单、短缺回滚、幂等/冲突、旧单终态、并发不超卖、换单链）
+  cutreplace.test.js     换单端到端（预览只读、原子换单、短缺回滚、幂等/冲突、旧单终态、并发不超卖、换单链）
+  comboorders.api.test.js 整套用料单端到端（预览只读、两类原子预留/短缺回滚、幂等/冲突、关联单锁定、取消各释放一次、并发不超卖、快照绑定、独立入口不受影响）
 ```
